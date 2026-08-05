@@ -2,16 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 
-// Must match HARD_LIMIT_MIN in app/api/chat/route.js
-const HARD_LIMIT_MIN = 15;
-
 // How many further messages a participant may send after the session ends.
 const MESSAGES_ALLOWED_AFTER_END = 2;
-
-// Idle nudges, measured from the last keystroke. Anyone actively typing resets
-// the clock, so a long answer is never interrupted; a half-finished sentence
-// left sitting for 75s still gets help. The nudge never clears their draft.
-const NUDGE_DELAYS_MS = [75000, 90000];
 
 // The six section headers the bot emits, in order. Must match the header text
 // in app/api/chat/system-prompt.txt — they drive the progress bar.
@@ -77,82 +69,17 @@ export default function Home() {
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [startedAt, setStartedAt] = useState(null);
-  const [now, setNow] = useState(Date.now());
   const [concluded, setConcluded] = useState(false);
   const [postEndCount, setPostEndCount] = useState(0);
 
-  const [lastActivity, setLastActivity] = useState(Date.now());
-  const [nudgeCount, setNudgeCount] = useState(0);
 
   const scrollRef = useRef(null);
-  const autoEndRef = useRef(false);
-
-  // Tick the countdown once a second, only while a session is running.
-  useEffect(() => {
-    if (!startedAt || concluded) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [startedAt, concluded]);
-
-  // When the clock runs out, fetch the conclusion without waiting for the
-  // participant to send anything — otherwise someone who stops typing before
-  // the end would never receive their end code.
-  useEffect(() => {
-    if (!startedAt || concluded || loading) return;
-    if (remainingMs > 0 || autoEndRef.current) return;
-    autoEndRef.current = true;
-
-    // Anything still sitting unsent in the box is submitted before the session
-    // closes, so a participant typing at 15:00 does not lose their last answer.
-    const draft = input.trim();
-    const finalMessages = draft
-      ? [...messages, { role: "user", content: draft }]
-      : messages;
-    if (draft) {
-      setInput("");
-      setMessages(finalMessages);
-    }
-
-    (async () => {
-      setLoading(true);
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages: finalMessages,
-            elapsedMs: HARD_LIMIT_MIN * 60000,
-          }),
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        setMessages([
-          ...finalMessages,
-          { role: "assistant", content: data.reply },
-        ]);
-        if (data.concluded) setConcluded(true);
-      } catch (err) {
-        setMessages([
-          ...finalMessages,
-          { role: "assistant", content: "⚠️ Error: " + err.message },
-        ]);
-      } finally {
-        setLoading(false);
-      }
-    })();
-  });
 
   // Keep the newest message in view.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, loading]);
-
-  const elapsedMs = startedAt ? now - startedAt : 0;
-  const remainingMs = Math.max(0, HARD_LIMIT_MIN * 60000 - elapsedMs);
-  const mm = String(Math.floor(remainingMs / 60000)).padStart(2, "0");
-  const ss = String(Math.floor((remainingMs % 60000) / 1000)).padStart(2, "0");
 
   const locked = concluded && postEndCount >= MESSAGES_ALLOWED_AFTER_END;
 
@@ -166,58 +93,10 @@ export default function Home() {
     if (transcript.includes(s.header)) sectionIndex = i;
   });
 
-  // A fresh phase gets a fresh nudge allowance.
-  useEffect(() => {
-    setNudgeCount(0);
-    setLastActivity(Date.now());
-  }, [sectionIndex]);
-
-  // Nudge a participant who has gone quiet with the box empty.
-  useEffect(() => {
-    if (!startedAt || concluded || locked || loading) return;
-    if (nudgeCount >= NUDGE_DELAYS_MS.length) return;
-
-    const id = setInterval(async () => {
-      if (Date.now() - lastActivity < NUDGE_DELAYS_MS[nudgeCount]) return;
-      setNudgeCount((n) => n + 1);
-      setLastActivity(Date.now());
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages,
-            elapsedMs: Date.now() - startedAt,
-            nudge: true,
-          }),
-        });
-        const data = await res.json();
-        if (data.skip || data.error || !data.reply) return;
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: data.reply },
-        ]);
-      } catch {
-        // a failed nudge is not worth surfacing to the participant
-      }
-    }, 5000);
-    return () => clearInterval(id);
-  }, [
-    startedAt,
-    concluded,
-    locked,
-    loading,
-    nudgeCount,
-    lastActivity,
-    messages,
-  ]);
-
   async function sendMessage(e) {
     e.preventDefault();
     if (!input.trim() || loading || locked) return;
 
-    const sentAt = Date.now();
-    setLastActivity(sentAt);
     if (concluded) setPostEndCount((n) => n + 1);
 
     const nextMessages = [...messages, { role: "user", content: input }];
@@ -229,20 +108,12 @@ export default function Home() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: nextMessages,
-          elapsedMs: startedAt ? sentAt - startedAt : 0,
-        }),
+        body: JSON.stringify({ messages: nextMessages }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
 
       setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
-      // The clock starts from the message that carried a valid start code.
-      if (data.started && !startedAt) {
-        setStartedAt(sentAt);
-        setNow(Date.now());
-      }
       if (data.concluded) setConcluded(true);
     } catch (err) {
       setMessages([
@@ -281,16 +152,6 @@ export default function Home() {
                     SECTIONS.length
                   }`}
             </span>
-            {startedAt && !concluded && (
-              <span
-                style={{
-                  ...styles.timer,
-                  ...(remainingMs < 180000 ? styles.timerLow : {}),
-                }}
-              >
-                {mm}:{ss} left
-              </span>
-            )}
             {concluded && <span style={styles.done}>Complete</span>}
           </div>
         </div>
@@ -316,10 +177,7 @@ export default function Home() {
         <textarea
           style={{ ...styles.input, ...(locked ? styles.inputLocked : {}) }}
           value={input}
-          onChange={(e) => {
-            setInput(e.target.value);
-            setLastActivity(Date.now());
-          }}
+          onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) sendMessage(e);
           }}

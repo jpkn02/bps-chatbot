@@ -8,27 +8,11 @@ const openai = new OpenAI({
 // Swap to "gpt-4o" here to test a stronger model.
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// Session timing, in minutes. Change these to retune the session.
-// The exercise is exactly 15 minutes long, timed from the moment the
-// participant types Start. Both values are 15, so every session concludes at
-// the same point: it cannot end earlier, and is forced to end there.
-const HARD_LIMIT_MIN = 15;
-const MIN_BEFORE_END_MIN = 15;
-
-// Latest-start deadlines per domain — maximums, not targets. Starting a domain
-// earlier is fine. Must line up with the schedule written into
-// system-prompt.txt.
-const DEADLINES = [
-  { byMin: 3.5, stage: "Phase 3, Your Social Life" },
-  { byMin: 7, stage: "Phase 4, Your Leisure and Interests" },
-  { byMin: 10.5, stage: "Phase 5, Your Personal Well-being" },
-];
-
 // Depth targets. The model cannot count words reliably, so the server counts
 // and tells it what to do.
 const WORD_TARGET = 50; // words per domain before moving on
 const SHORT_FIRST_TURN = 25; // below this, probe with a scene question
-const MAX_PROBE_ROUNDS = 4; // escape hatch for disengaged participants
+const MAX_PROBE_ROUNDS = 2; // hard ceiling on follow-up rounds per phase
 const NOTHING_TO_REFLECT = 15; // below this, skip the reflection entirely
 // Thin first replies get a reminder to write more. Triggered on word count
 // only: participants are told not to worry about grammar, so counting
@@ -42,16 +26,6 @@ const DETAIL_REMINDER =
 // The clock starts when the participant types Start after this block.
 const INTRO_HEADER = "Phase 1: Introduction";
 const START_WORD = "start";
-
-// Markers the model must use verbatim, so the server can tell which step of the
-// spare-time sequence has already happened.
-const INTERIM_INVITE =
-  "Looking at this now, take your time and try to add onto what you've written about so far.";
-const INTERIM_FOOTER =
-  "Feel free to either copy and paste this text to make edits, or just type what you'd like to add on into the chat below.";
-const INTERIM_MARKER = "Looking at this now, take your time";
-const DAYLIFE_MARKER = "one ordinary day";
-const HOLD_MARKER = "sit with what you have written";
 
 // Off-task handling. The re-ask is fixed text, and its presence in the
 // transcript is how later turns know which replies to discount.
@@ -91,48 +65,6 @@ const IDENTITY_MARKER = "I'm an AI chatbot";
 const IDENTITY_REPLY =
   "I'm an AI chatbot, here to guide you through this writing exercise. Let's carry on \u2014 take your time and keep writing about this part of your future.";
 const MAX_IDENTITY_ANSWERS = 2;
-
-// The standardized close to every writing phase. Deliberately close-ended, with
-// a second door: "add something" or "say more about something you mentioned".
-const CLOSING_QUESTION =
-  "Before we move on, is there anything you'd like to add, or any part you mentioned that you'd like to share more about?";
-const CLOSING_Q_MARKER = "anything you'd like to add, or any part you mentioned";
-const AFFIRM_CUES =
-  /^(yes|yeah|yea|yep|yup|sure|ok|okay|i do|there is|there's|maybe|a bit|kind of|kinda)\b/i;
-const AFFIRM_REPLY = "Of course — go ahead, take your time.";
-
-// Standardized questions the bot asks that are NOT writing prompts. A reply to
-// one of these ("not really", "no thanks") is a normal answer, not nonsense, so
-// the off-task classifier must not see it. Probe rounds and phase prompts are
-// deliberately absent: nonsense does arrive in answer to those.
-const NON_WRITING_QUESTIONS = [
-  CLOSING_Q_MARKER,
-  "another part of your future you'd like to add to",
-  "take your time and try to add onto what you've written",
-];
-
-// True when the bot's last message was this phase's closing question, so the
-// participant's reply is a yes/no answer to it rather than more writing.
-function answeringClosingQuestion(messages) {
-  const lastBot = [...messages].reverse().find((m) => m.role === "assistant");
-  return Boolean(lastBot) && String(lastBot.content).includes(CLOSING_Q_MARKER);
-}
-
-const CLOSING_ANSWER_NOTICE =
-  "CLOSING ANSWER NOTICE: The participant is answering the closing question for this phase, so this reply is a yes or a no, not more writing. Ignore any word target — it does not apply here. Read their answer however they have phrased it: \"yes\", \"sure\", \"there is one thing\" mean yes; \"no\", \"not really\", \"nah I'm good\", \"can't think of anything\", \"nope that's it\", \"all good\" mean no. If it means yes, reply with one short warm line inviting them to write it, and nothing else. If it means no, do not comment on their answer and do not ask anything further — move straight on and open the next phase, giving its standardized block in full. If they have written their addition instead of answering, treat it as the addition.";
-
-function answeringStandardQuestion(messages) {
-  const lastBot = [...messages]
-    .reverse()
-    .find((m) => m.role === "assistant");
-  if (!lastBot) return false;
-  return NON_WRITING_QUESTIONS.some((q) => String(lastBot.content).includes(q));
-}
-
-function isAffirmative(text) {
-  const s = String(text).trim();
-  return Boolean(s) && countWords(s) <= 5 && AFFIRM_CUES.test(s);
-}
 
 // Explicit risk disclosures. Deliberately narrow, and it only ever adds a
 // notice for the model — the model's own judgement still applies to everything
@@ -178,10 +110,6 @@ function isRefusal(text) {
   return REFUSAL_CUES.test(String(text));
 }
 
-// Appended to notices on paths that sit far from the main prompt rules, where
-// praise and recaps otherwise creep back in.
-const RECAP_BAN =
-  "Do not summarise or repeat back what they just wrote, and do not open with a recap. Do not praise, compliment, or characterise it — no \"that's great\", no \"lovely\", no telling them what their future sounds like. Open with a plain line such as \"Let's stay with this a little longer.\" and go straight to the questions, naming their own specifics inside the questions themselves.";
 
 // The example opening lines offered to a stuck participant, per phase.
 const PHASE_STUCK_HELP = {
@@ -253,19 +181,6 @@ const PHASE_SUBJECTS = {
     "their physical and mental well-being, and the personal qualities they have developed",
 };
 
-// Fixed nudge openers for a participant who has gone quiet.
-const NUDGE_OPENERS = [
-  "Hey there — if you're having trouble writing, here are some more guiding questions you can consider, in addition to the ones I mentioned earlier:",
-  "Still here whenever you are. Even a sentence or two is a fine place to start — here are a couple more questions you might consider:",
-];
-
-// Once the participant has declined twice there is nothing left to generate, so
-// this is served straight from the server. The model was asked to hold and
-// sometimes started asking questions again anyway; a fixed line cannot drift.
-const HOLD_REPLY =
-  "Thank you for what you've written. You can sit with what you have written for now, and I'll close things off shortly.";
-const DECLINE_WORDS = 15; // a reply shorter than this counts as "nothing more"
-
 // A short reply carrying a closure cue means the participant is done with this
 // phase. That is respected even if the word target has not been met — probing
 // someone who has just said they have nothing more is what produced loops.
@@ -332,26 +247,9 @@ function missingStarter(text) {
   return header && !body.includes(PHASE_STARTERS[header]) ? header : null;
 }
 
-// How many nudges have already gone out in the current phase.
-function nudgeIndex(messages) {
-  let start = 0;
-  messages.forEach((m, i) => {
-    if (m.role === "assistant" && DOMAIN_HEADERS.some((h) => String(m.content).includes(h))) {
-      start = i;
-    }
-  });
-  return messages
-    .slice(start)
-    .filter(
-      (m) =>
-        m.role === "assistant" &&
-        NUDGE_OPENERS.some((o) => String(m.content).includes(o.slice(0, 40)))
-    ).length;
-}
-
 // "complete" = wrote something in all four phases. "partial" = wrote something,
-// but not everywhere. "none" = nothing at all. Off-task replies and bare
-// declines do not count as writing.
+// but not everywhere. "none" = nothing at all. Off-task replies, stuck replies,
+// refusals and bare declines do not count as writing.
 function completionState(messages) {
   const counts = {};
   let current = null;
@@ -363,22 +261,17 @@ function completionState(messages) {
     }
     if (m.role !== "user" || !current) return;
     const next = messages[i + 1];
-    const offTask =
-      next &&
-      next.role === "assistant" &&
-      String(next.content).includes(OFF_TASK_MARKER);
-    const stuck =
-      next && next.role === "assistant" && isStuckReply(next.content);
-    const refusedHere =
-      next &&
-      next.role === "assistant" &&
-      String(next.content).includes(PHASE_REFUSAL_ACK);
-    const identity =
-      next &&
-      next.role === "assistant" &&
-      String(next.content).includes(IDENTITY_MARKER);
-    if (offTask || stuck || refusedHere || identity || isDecline(m.content))
+    const answered =
+      next && next.role === "assistant" ? String(next.content) : "";
+    if (
+      answered.includes(OFF_TASK_MARKER) ||
+      isStuckReply(answered) ||
+      answered.includes(PHASE_REFUSAL_ACK) ||
+      answered.includes(IDENTITY_MARKER) ||
+      isDecline(m.content)
+    ) {
       return;
+    }
     counts[current] = (counts[current] || 0) + countWords(m.content);
   });
 
@@ -450,9 +343,6 @@ function phaseStats(messages) {
   // Any decline in this phase counts, not just the most recent turn — a later
   // "ok" must not undo the fact that they already said they were finished.
   const declined = userTurns.some((m) => isDecline(m.content));
-  const closingAsked = since.some(
-    (m) => m.role === "assistant" && String(m.content).includes(CLOSING_Q_MARKER)
-  );
 
   return {
     header,
@@ -460,7 +350,6 @@ function phaseStats(messages) {
     stuckCount,
     identityCount,
     refused,
-    closingAsked,
     userTurns,
     totalWords,
     firstTurnWords: countWords(userTurns[0].content),
@@ -476,98 +365,16 @@ function phaseStats(messages) {
   };
 }
 
-// True once the last phase has met its depth criteria, i.e. the writing phases
-// are finished and any remaining time is spare.
-function inExtraTime(messages) {
-  // Once the spare-time sequence has begun it never reverts to phase probing,
-  // whatever the participant types next.
-  const said = messages
-    .filter((m) => m.role === "assistant")
-    .map((m) => String(m.content))
-    .join("\n");
-  if (
-    said.includes(INTERIM_MARKER) ||
-    said.includes(DAYLIFE_MARKER) ||
-    said.includes(HOLD_MARKER)
-  ) {
-    return true;
-  }
-
-  const stats = phaseStats(messages);
-  if (!stats) return false;
-  if (stats.header !== DOMAIN_HEADERS[DOMAIN_HEADERS.length - 1]) return false;
-  return Boolean(stats.complete);
-}
-
-// True once the participant has declined both the draft and the day walkthrough,
-// or has already been put on hold.
-function inHoldState(messages) {
-  const said = messages
-    .filter((m) => m.role === "assistant")
-    .map((m) => String(m.content))
-    .join("\n");
-  if (said.includes(HOLD_MARKER)) return true;
-
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const lastText = lastUser ? String(lastUser.content) : "";
-  const declined = isDecline(lastText) || countWords(lastText) < 4;
-  return said.includes(INTERIM_MARKER) && said.includes(DAYLIFE_MARKER) && declined;
-}
-
-// Spare time after all four phases are done. Runs a fixed sequence so the model
-// always has a fresh task and can never fall back into re-probing one phase.
-function extraTimeNotice(messages) {
-  const said = messages
-    .filter((m) => m.role === "assistant")
-    .map((m) => String(m.content))
-    .join("\n");
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const lastText = lastUser ? String(lastUser.content) : "";
-  // Cue-based, not length-based: "I also volunteer on Sundays" is eight words
-  // of real material and must not be read as "nothing more".
-  const declined = isDecline(lastText) || countWords(lastText) < 4;
-
-  const interimDone = said.includes(INTERIM_MARKER);
-  const dayLifeDone = said.includes(DAYLIFE_MARKER);
-
-  // Once the hold has been issued it is permanent. Someone who has declined
-  // twice does not get asked again just because they typed "ok".
-  if (said.includes(HOLD_MARKER)) {
-    return `EXTRA TIME NOTICE: This participant has finished contributing and is waiting for the session to end. Ask nothing. Reply with one short warm sentence and nothing else, whatever they write. Do not ask questions, do not repeat earlier questions, do not conclude, and do not reveal the end code.`;
-  }
-
-  if (!interimDone) {
-    return `EXTRA TIME NOTICE: All four writing phases are finished and time remains. Do not conclude and do not reveal the end code. Send exactly one message made of these four parts, in this order, with a blank line between each and nothing else added:
-
-(1) A short interim narrative of their future in flowing prose, with no header and no bullets, built only from what they themselves wrote across the four phases. Every rule that governs the Phase 6 synthesis governs this one: invent no detail they did not give, append no meaning to their details, use no descriptive word they did not write themselves, and make no evaluation of them or of their writing.
-
-(2) This line, word for word: "${INTERIM_INVITE}"
-
-(3) At most three follow-up questions, each on its own line beginning with a hyphen and a space, fitted to what they actually wrote and never repeating a question already asked.
-
-(4) This line, word for word: "${INTERIM_FOOTER}"
-
-Never ask whether the narrative is accurate, never ask them to check, correct or fix it, and never offer to change it.`;
-  }
-
-  if (!dayLifeDone && declined) {
-    return `EXTRA TIME NOTICE: They had nothing to add to the draft, and time still remains. Do not conclude and do not repeat any question you have already asked. Ask them instead, warmly and in one or two sentences of plain prose with no bullets and no header, to walk you through "${DAYLIFE_MARKER}" in this future life, from waking up to going to sleep, in the order it happens.`;
-  }
-
-  if (!dayLifeDone) {
-    return `EXTRA TIME NOTICE: They have added new material and time remains. Ask one round of two or three questions, each on its own line beginning with a hyphen and a space. Ask about a DIFFERENT area of their future from the one your last round covered — rotate between their professional life, their social life, their leisure and interests, and their well-being rather than staying on one topic. Never spend two rounds in a row on the same subject, and never press a subject they have asked to leave. Do not conclude.${RECAP_BAN}`;
-  }
-
-  if (declined) {
-    return `EXTRA TIME NOTICE: They have now declined twice and time still remains on the clock. Stop asking questions altogether. Reply with exactly one short warm sentence that contains the phrase "${HOLD_MARKER}" — for example "You can ${HOLD_MARKER}, and I'll close things off shortly." — and write nothing else. Ask nothing, repeat nothing, do not conclude, and do not reveal the end code. If they write again, reply the same way.`;
-  }
-
-  return `EXTRA TIME NOTICE: They are still writing and time remains. Ask one round of two or three questions, each on its own line beginning with a hyphen and a space. Ask about a DIFFERENT area of their future from the one your last round covered — rotate between their professional life, their social life, their leisure and interests, and their well-being rather than staying on one topic. Never spend two rounds in a row on the same subject, and never press a subject they have asked to leave. Do not conclude.${RECAP_BAN}`;
-}
-
 function depthNotice(messages) {
   const stats = phaseStats(messages);
   if (!stats || stats.empty) return null;
+
+  // There is no phase after the last one — that is where the session ends.
+  const isLastPhase =
+    stats.header === DOMAIN_HEADERS[DOMAIN_HEADERS.length - 1];
+  const onward = isLastPhase
+    ? "This was the final writing phase, so the exercise is over. Deliver the Phase 6 conclusion now: its bold header, the standardized line inviting them to read it, the narrative built from everything they wrote across all four phases, then the standardized closing message with the end code."
+    : "Move straight on and open the next phase.";
 
   const {
     header,
@@ -576,34 +383,31 @@ function depthNotice(messages) {
     firstTurnWords,
     rounds,
     declined,
-    closingAsked,
   } = stats;
-  const closeStep = closingAsked
-    ? "You have already asked the closing question in this phase, so do not ask it again. Move straight on to the next phase."
-    : `Ask the closing question for this phase, worded exactly: "${CLOSING_QUESTION}" Write nothing else in that message.`;
   const firstReplyThin = firstTurnWords < WORD_TARGET;
-  const reminder = ` Format this reply exactly as follows: the plain introductory line, then the questions each on their own line beginning with a hyphen and a space, then a blank line, then this sentence on its own line, word for word: "${DETAIL_REMINDER}" Do not drop the hyphens and do not drop the introductory line.`;
-
+  const reminder = firstReplyThin
+    ? ` Format this reply exactly as follows: the plain introductory line, then the questions each on their own line beginning with a hyphen and a space, then a blank line, then this sentence on its own line, word for word: "${DETAIL_REMINDER}" Do not drop the hyphens and do not drop the introductory line.`
+    : "";
   const facts = `DEPTH NOTICE: In "${header}", the participant has written ${totalWords} words across ${userTurns.length} repl${
     userTurns.length === 1 ? "y" : "ies"
   }, their first reply here was ${firstTurnWords} words, and you have asked ${rounds} round(s) of follow-up questions in this domain.`;
 
   if (rounds === 0) {
     if (firstTurnWords < SHORT_FIRST_TURN) {
-      return `${facts} That opening reply is short. Ask exactly three questions, and make the first one a scene question that walks them through a concrete moment in time — what a normal day looks like from morning to night, or a single moment pictured in detail. Abstract questions will not draw more out of them; a concrete scene will.${reminder}`;
+      return `${facts} That opening reply is short, but it is not empty — build on whatever they did name. Ask exactly three questions. The first must be a scene question walking them through a concrete moment in time, built around the thing they actually mentioned: if they said they will be a teacher at a primary school, ask what a morning in that classroom will look like, not what a normal day looks like in general. The other two must also refer to something in their own words. Never send a question that could have been put to any other participant unchanged.${reminder}`;
     }
     if (firstTurnWords > WORD_TARGET) {
-      return `${facts} They have already given breadth here, so do not ask them to cover more ground. Ask exactly two questions, both drilling further into one single concrete detail they named — choose the most specific image in what they wrote and have them zoom into it.`;
+      return `${facts} They have already given breadth here, so do not ask them to cover more ground. Ask exactly two questions, both drilling further into one single concrete detail they named — choose the most specific image in what they wrote and have them zoom into it. Both must quote or closely echo their own words.`;
     }
-    return `${facts} Ask exactly three questions. At least one must name something concrete the participant actually wrote — a place, person, object or action from their own reply — inside the question itself, so it could not have been asked of anyone else. Draw the rest from the bank.${reminder}`;
+    return `${facts} Ask exactly three questions. At least two must name something concrete the participant actually wrote — a place, person, object or action from their own reply — inside the question itself. Draw the remaining one from the bank and fit its wording to their material. Never send a question that could have been put to any other participant unchanged.${reminder}`;
   }
 
   if (rounds >= MAX_PROBE_ROUNDS && totalWords < NOTHING_TO_REFLECT) {
-    return `${facts} You have probed this phase enough and they have given you essentially nothing to work with. Do not summarise, do not remark on how little they wrote, and do not mention that they were unsure or could not picture it. Write one short, easy, unbothered sentence moving things along, then open the next phase. That next opening prompt must still be delivered in full and word for word, including its bold header, its bulleted questions, and its suggested opening lines.`;
+    return `${facts} This phase has had its two rounds and they have given you essentially nothing to work with. Do not summarise, do not remark on how little they wrote, and do not mention that they were unsure or could not picture it. Write one short, easy, unbothered sentence moving things along. ${onward} That next opening prompt must still be delivered in full and word for word, including its bold header, its bulleted questions, and its suggested opening lines.`;
   }
 
   if (rounds >= MAX_PROBE_ROUNDS) {
-    return `${facts} You have probed this phase enough and they are not producing more. Ask no further questions here, and do not summarise what they wrote. ${closeStep}`;
+    return `${facts} This phase has had its two rounds. Ask no further questions here and do not summarise what they wrote. ${onward}`;
   }
 
   if (declined && (rounds >= 1 || totalWords >= NOTHING_TO_REFLECT)) {
@@ -611,48 +415,12 @@ function depthNotice(messages) {
   }
 
   if (totalWords < WORD_TARGET) {
-    return `${facts} That is below the ${WORD_TARGET}-word target for a domain, so do not move on yet. Ask another round of two or three questions, drilling into what they have already named rather than opening new ground.`;
+    return `${facts} That is below the ${WORD_TARGET}-word target for this phase, so do not move on yet. Ask another round of two or three questions. Every one of them must drill into something they have already named rather than opening new ground, and none may repeat a question already asked.`;
   }
 
-  return `${facts} They have passed the ${WORD_TARGET}-word target for this phase. Do not summarise what they wrote. ${closeStep}`;
+  return `${facts} They have passed the ${WORD_TARGET}-word target for this phase. Do not summarise what they wrote. ${onward}`;
 }
 
-function scheduleLine(elapsedMin) {
-  const overdue = DEADLINES.filter((d) => elapsedMin >= d.byMin).pop();
-  const upcoming = DEADLINES.find((d) => elapsedMin < d.byMin);
-
-  if (overdue) {
-    return `You are behind schedule: by now you should have reached ${overdue.stage}. Do not skip any domain to catch up. Move to the next domain you have not yet covered and compress from here — one round of follow-ups per phase, one short sentence of reflection, and no closing question — until all four writing phases are covered.`;
-  }
-  return `Nothing is overdue. The next deadline is ${upcoming.stage}, which must be started by minute ${upcoming.byMin}.`;
-}
-
-function timeNotice(elapsedMs, extraTime) {
-  const elapsedMin = elapsedMs / 60000;
-  const shown = Math.floor(elapsedMin);
-
-  if (elapsedMin >= HARD_LIMIT_MIN) {
-    return "TIME NOTICE: Time is up. Stop the writing phase now, whatever domain you are on. Move straight to the Phase 6 conclusion using whatever the participant has already shared. Give the Phase 6 header, the extra 'Our time is up for today.' line, then the narrative, then the standardized closing message with the end code. Do not mention the timer to the participant.";
-  }
-
-  if (elapsedMin >= MIN_BEFORE_END_MIN) {
-    return `TIME NOTICE: ${shown} minutes have elapsed. The writing phases are over. Move to the Phase 6 conclusion now — header, narrative synthesis, then the standardized closing message. Do not mention the timer to the participant.`;
-  }
-
-  // In spare time there is no schedule left to chase, and telling the model it
-  // is "behind" would push it back into phase work it has already completed.
-  if (extraTime) {
-    return `TIME NOTICE: THE SESSION IS NOT OVER. Only ${shown} of the ${MIN_BEFORE_END_MIN} minutes have passed and there is still time left on the clock. The four writing phases are done, so there is no schedule to catch up on and no phase to reopen, but that is not the same as the session ending. Do not write the Phase 6 conclusion. Do not write "Our time is up for today." Do not reveal the end code. Follow the EXTRA TIME NOTICE exactly and keep the exercise going. Never mention the timer to the participant.`;
-  }
-
-  return `TIME NOTICE: ${shown} minutes have elapsed of a ${MIN_BEFORE_END_MIN} minute writing phase. ${scheduleLine(
-    elapsedMin
-  )} These are latest-start deadlines, not targets — if the participant has already given a domain enough concrete detail, move on ahead of schedule rather than padding it out. You may not deliver the synthesis or the ending code before minute ${MIN_BEFORE_END_MIN}; if all four domains are done before then, go back to the domain they said least about and probe there. Never mention the timer or the schedule to the participant.`;
-}
-
-// One narrow yes/no judgement, deliberately kept out of the main prompt so the
-// session rules cannot pull it around. Fails open: a genuine answer wrongly
-// rejected is far worse than a bad one let through.
 async function isOnTask(phaseHeader, text) {
   try {
     const r = await openai.chat.completions.create({
@@ -727,7 +495,7 @@ async function ask(messages, notices, endCode) {
 
 export async function POST(request) {
   try {
-    const { messages, elapsedMs = 0, nudge = false } = await request.json();
+    const { messages } = await request.json();
     // Which code this session earns. The model is only ever shown one of them,
     // so there is nothing for it to confuse or leak.
     const state = completionState(messages);
@@ -774,8 +542,8 @@ export async function POST(request) {
       return Response.json({ reply: BAD_CODE_LINE, started: false });
     }
 
-    // The clock starts when the participant types Start after the introduction
-    // — not at code entry, and not on page load.
+    // The exercise begins when the participant types Start after the
+    // introduction — not at code entry, and not on page load.
     const introIndex = messages.findIndex(
       (m) => m.role === "assistant" && String(m.content).includes(INTRO_HEADER)
     );
@@ -793,38 +561,14 @@ export async function POST(request) {
 
     const startNotice =
       introIndex !== -1 && !started
-        ? "START NOTICE: The participant has not typed Start yet, so the exercise has not begun and the clock is not running. Do not open Phase 2 and do not treat their message as an answer to anything. Reply with one warm sentence asking them to type Start when they are ready, and nothing else."
+        ? "START NOTICE: The participant has not typed Start yet, so the exercise has not begun. Do not open Phase 2 and do not treat their message as an answer to anything. Reply with one warm sentence asking them to type Start when they are ready, and nothing else."
         : null;
-
-    // Once the writing phase is over, depth no longer applies — suppress the
-    // notice entirely rather than leaving the model to arbitrate a conflict.
-    const writingPhaseOver = elapsedMs >= MIN_BEFORE_END_MIN * 60000;
-    // Reached the end having written nothing: there is no narrative to build
-    // and no code to give, so this is served whole rather than generated.
-    if (writingPhaseOver && state === "none") {
-      return Response.json({ reply: NO_WRITING_REPLY, concluded: true });
-    }
-
-    const extraTime = !writingPhaseOver && inExtraTime(messages);
-
-    // Idle nudge: the participant has gone quiet, so offer a couple more
-    // guiding questions. Skipped once they have said they are finished.
-    if (nudge) {
-      if (writingPhaseOver || extraTime) {
-        return Response.json({ skip: true });
-      }
-      const opener = NUDGE_OPENERS[Math.min(nudgeIndex(messages), 1)];
-      const reply = await ask(messages, [
-        `NUDGE NOTICE: The participant has gone quiet and has not written anything for a while. Do not treat this as an answer and do not move the exercise on. Reply with exactly two parts and nothing else: first this line word for word — "${opener}" — then exactly two guiding questions for the phase they are currently in, each on its own line beginning with a hyphen and a space. Draw them from the question bank and fit them to whatever they have written so far. Before you send, read back through every question already in this conversation, including any in an earlier nudge, and pick two that do not appear anywhere in it — repeating a question you have already put to them is not acceptable. Add no header, no reflection, no other sentence, and never remark on their silence.`,
-      ], endCode);
-      return Response.json({ reply, started: true, concluded: false });
-    }
 
     const stats = phaseStats(messages);
     const last = messages[messages.length - 1];
 
-    // Distress overrides everything: no classifier, no depth targets, no
-    // schedule, no phase machinery.
+    // Distress overrides everything: no classifier, no depth targets, no phase
+    // machinery.
     if (last && last.role === "user" && isDistress(last.content)) {
       const reply = await ask(messages, [DISTRESS_NOTICE], endCode);
       return Response.json({ reply, started: true, concluded: false });
@@ -852,31 +596,10 @@ export async function POST(request) {
       }
     }
 
-    // "Yes" to the closing question: invite them to write, rather than treating
-    // a one-word answer as content or as nonsense.
-    if (
-      stats &&
-      !writingPhaseOver &&
-      last &&
-      last.role === "user" &&
-      isAffirmative(last.content) &&
-      messages.some(
-        (m) =>
-          m.role === "assistant" && String(m.content).includes(CLOSING_Q_MARKER)
-      )
-    ) {
-      return Response.json({
-        reply: AFFIRM_REPLY,
-        started: true,
-        concluded: false,
-      });
-    }
-
     // Asked what I am. Answered honestly, identically every time, then back to
     // the exercise.
     if (
       stats &&
-      !writingPhaseOver &&
       last &&
       last.role === "user" &&
       isIdentityQuestion(last.content) &&
@@ -893,8 +616,6 @@ export async function POST(request) {
     // is left unwritten, which is what earns the incomplete end code.
     if (
       stats &&
-      !extraTime &&
-      !writingPhaseOver &&
       last &&
       last.role === "user" &&
       isRefusal(last.content)
@@ -919,12 +640,9 @@ export async function POST(request) {
     // didn't understand you".
     if (
       stats &&
-      !extraTime &&
-      !writingPhaseOver &&
       last &&
       last.role === "user" &&
       isStuck(last.content) &&
-      !answeringClosingQuestion(messages.slice(0, -1)) &&
       (stats.stuckCount || 0) < MAX_STUCK_HELPS &&
       PHASE_STUCK_HELP[stats.header]
     ) {
@@ -940,14 +658,11 @@ export async function POST(request) {
     // is a legitimate answer, not an attempt at the task.
     if (
       stats &&
-      !extraTime &&
-      !writingPhaseOver &&
       last &&
       last.role === "user" &&
       !isDecline(last.content) &&
       !isStuck(last.content) &&
       !looksLikeQuestion(last.content) &&
-      !answeringStandardQuestion(messages.slice(0, -1)) &&
       (stats.offTaskCount || 0) < MAX_OFF_TASK_REASKS &&
       !(await isOnTask(stats.header, last.content))
     ) {
@@ -958,75 +673,11 @@ export async function POST(request) {
       });
     }
 
-    // Topic refusal during spare time. First one redirects and hands them the
-    // choice; a second means they are finished, so questioning stops.
-    if (extraTime && last && last.role === "user" && isRefusal(last.content)) {
-      const refusals = messages.filter(
-        (m) => m.role === "assistant" && String(m.content).includes(REDIRECT_MARKER)
-      ).length;
-      return Response.json({
-        reply: refusals >= 1 ? HOLD_REPLY : REDIRECT_REPLY,
-        started: true,
-        concluded: false,
-      });
-    }
-
-    // Nothing left to ask and the clock has not run out: hold, without spending
-    // a model call on it.
-    if (extraTime && inHoldState(messages)) {
-      return Response.json({ reply: HOLD_REPLY, started: true, concluded: false });
-    }
-
-    const closingAnswer =
-      !extraTime &&
-      !writingPhaseOver &&
-      last &&
-      last.role === "user" &&
-      answeringClosingQuestion(messages.slice(0, -1));
-
-    const notices = [
-      startNotice ?? timeNotice(elapsedMs, extraTime),
-      startNotice || writingPhaseOver
-        ? null
-        : closingAnswer
-        ? CLOSING_ANSWER_NOTICE
-        : extraTime
-        ? extraTimeNotice(messages)
-        : depthNotice(messages),
-    ].filter(Boolean);
+    const notices = [startNotice ?? depthNotice(messages)].filter(Boolean);
     let reply = await ask(messages, notices, endCode);
 
     // Floor on session length: if the model tries to hand out the ending code
     // early, reject that reply and make it keep going.
-    // Premature ending, whether or not it carried the code: the "time is up"
-    // line and the Phase 6 header both count as concluding.
-    const tooEarly =
-      elapsedMs < MIN_BEFORE_END_MIN * 60000 &&
-      ((Boolean(endCode) && reply.includes(endCode)) ||
-        reply.includes("Phase 6: Conclusion") ||
-        reply.includes("Our time is up for today"));
-
-    if (tooEarly) {
-      reply = await ask(messages, [
-        ...notices,
-        `TIME NOTICE: You were about to end the session too early. Only ${Math.floor(
-          elapsedMs / 60000
-        )} minutes have elapsed and the exercise may not conclude before minute ${MIN_BEFORE_END_MIN}. Do not write the Phase 6 conclusion, do not write "Our time is up for today.", and do not reveal the end code. The session is still running. Continue the exercise instead: stay with whatever the participant wrote most recently and ask one round of two or three follow-up questions about it, each on its own line beginning with a hyphen and a space.`,
-      ], endCode);
-    }
-
-    const malformed = malformedPhaseBlock(reply);
-    if (malformed) {
-      reply = await ask(
-        messages,
-        [
-          ...notices,
-          `FORMAT NOTICE: Your previous attempt opened "${malformed}" incorrectly. That phase's bold header must be followed immediately by its opening sentence, word for word, with nothing in between and nothing paraphrased. If you are referring back to something they mentioned in an earlier phase, that sentence goes BEFORE the header, never after it. Send the message again: optional carry-over sentence first, then the header, then the standardized block in full and unaltered.`,
-        ],
-        endCode
-      );
-    }
-
     // Standardized blocks must arrive whole, including the starter line, which
     // the model otherwise trims when it is behind schedule.
     const dropped = missingStarter(reply);
