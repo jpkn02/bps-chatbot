@@ -10,17 +10,24 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 // Depth targets. The model cannot count words reliably, so the server counts
 // and tells it what to do.
-const WORD_TARGET = 50; // words per domain before moving on
-const SHORT_FIRST_TURN = 25; // below this, probe with a scene question
-const MAX_PROBE_ROUNDS = 2; // hard ceiling on follow-up rounds per phase
-const NOTHING_TO_REFLECT = 15; // below this, skip the reflection entirely
-// Thin first replies get a reminder to write more. Triggered on word count
-// only: participants are told not to worry about grammar, so counting
-// full stops would penalise anyone who writes without punctuation.
+const FOLLOW_UPS_PER_PHASE = 2; // the scene, then the felt experience
 
-// Appended verbatim after the follow-up questions when a first reply is thin.
-const DETAIL_REMINDER =
-  "Please take your time and aim for three sentences or more, to give more detail about this part of your future life.";
+// One scene form and one felt form per phase, assigned by phase index so no
+// form is ever used twice in a session. Four phases, four of each: they line up
+// exactly. The model rewrites the chosen form around the participant's own
+// material but must keep its shape.
+const SCENE_FORMS = [
+  "What'll a normal day look like? I'd love to hear more about that, from morning to night.",
+  "Picture one particular moment in this future, what'll be happening?",
+  "What does that moment look like to you? I'm curious about what comes to mind for you.",
+  "I'm wondering now, how do you think this will unfold?",
+];
+const FELT_FORMS = [
+  "As you imagine yourself there, what will it probably feel like?",
+  "Could you tell me more about what would feel especially meaningful to you about this part of your future?",
+  "What do you think you'd enjoy most about having this be part of your life? I'd love to get a better sense of that.",
+  "I'd like to know more — when that happens, how do you think you will feel?",
+];
 
 // Must match the domain headers in system-prompt.txt.
 // The clock starts when the participant types Start after this block.
@@ -287,12 +294,24 @@ function countWords(text) {
   return t ? t.split(/\s+/).length : 0;
 }
 
-// Counts follow-up probe rounds. Deliberately matches only "- " lines: the
-// standardized blocks use "* " bullets and must not be counted as probes.
-function hasBullets(text) {
-  return String(text)
-    .split("\n")
-    .some((line) => line.trimStart().startsWith("- "));
+// Follow-ups are plain prose now, so they are counted by exclusion: any bot
+// message in this phase that is not a standardized block and not one of the
+// fixed canned replies is a follow-up.
+function isCannedReply(text) {
+  const s = String(text);
+  return (
+    s.includes(OFF_TASK_MARKER) ||
+    isStuckReply(s) ||
+    s.includes(PHASE_REFUSAL_ACK) ||
+    s.includes(IDENTITY_MARKER) ||
+    s.includes(DISTRESS_MARKER)
+  );
+}
+
+function isFollowUp(text) {
+  const s = String(text);
+  if (isCannedReply(s)) return false;
+  return !DOMAIN_HEADERS.some((h) => s.includes(h)) && !s.includes("Phase 6");
 }
 
 // Word counts and probe rounds for whichever phase is currently open.
@@ -338,7 +357,7 @@ function phaseStats(messages) {
 
   const totalWords = userTurns.reduce((n, m) => n + countWords(m.content), 0);
   const rounds = since.filter(
-    (m) => m.role === "assistant" && hasBullets(m.content)
+    (m) => m.role === "assistant" && isFollowUp(m.content)
   ).length;
   // Any decline in this phase counts, not just the most recent turn — a later
   // "ok" must not undo the fact that they already said they were finished.
@@ -356,11 +375,7 @@ function phaseStats(messages) {
     rounds,
     // Phase is finished on any of: word target met, probed out, or the
     // participant saying they have nothing more once there is something there.
-    complete:
-      refused ||
-      totalWords >= WORD_TARGET ||
-      rounds >= MAX_PROBE_ROUNDS ||
-      (declined && (rounds >= 1 || totalWords >= NOTHING_TO_REFLECT)),
+    complete: refused || rounds >= FOLLOW_UPS_PER_PHASE || declined,
     declined,
   };
 }
@@ -369,56 +384,32 @@ function depthNotice(messages) {
   const stats = phaseStats(messages);
   if (!stats || stats.empty) return null;
 
-  // There is no phase after the last one — that is where the session ends.
-  const isLastPhase =
-    stats.header === DOMAIN_HEADERS[DOMAIN_HEADERS.length - 1];
+  const { header, rounds, declined, refused } = stats;
+  const phaseIndex = DOMAIN_HEADERS.indexOf(header);
+  const isLastPhase = phaseIndex === DOMAIN_HEADERS.length - 1;
+
   const onward = isLastPhase
     ? "This was the final writing phase, so the exercise is over. Deliver the Phase 6 conclusion now: its bold header, the standardized line inviting them to read it, the narrative built from everything they wrote across all four phases, then the standardized closing message with the end code."
-    : "Move straight on and open the next phase.";
+    : "Move straight on and open the next phase, giving its standardized block in full.";
 
-  const {
-    header,
-    userTurns,
-    totalWords,
-    firstTurnWords,
-    rounds,
-    declined,
-  } = stats;
-  const firstReplyThin = firstTurnWords < WORD_TARGET;
-  const reminder = firstReplyThin
-    ? ` Format this reply exactly as follows: the plain introductory line, then the questions each on their own line beginning with a hyphen and a space, then a blank line, then this sentence on its own line, word for word: "${DETAIL_REMINDER}" Do not drop the hyphens and do not drop the introductory line.`
-    : "";
-  const facts = `DEPTH NOTICE: In "${header}", the participant has written ${totalWords} words across ${userTurns.length} repl${
-    userTurns.length === 1 ? "y" : "ies"
-  }, their first reply here was ${firstTurnWords} words, and you have asked ${rounds} round(s) of follow-up questions in this domain.`;
+  const style =
+    " Take the form above and rewrite it around what this participant actually wrote, keeping its shape and its wording as close as you can while swapping in their own specifics. Do not merge in other questions, do not bolt extra questions onto it, and do not invent a different question. Ask one question only, in plain prose, with no bullet points and no introductory line before it. Never summarise or repeat their answer back to them, and never praise or characterise it.";
+
+  const facts = `DEPTH NOTICE: In "${header}", you have asked ${rounds} of the ${FOLLOW_UPS_PER_PHASE} follow-up questions for this phase.`;
+
+  if (refused || declined) {
+    return `${facts} They have said they have nothing more to add here, so ask nothing further and do not summarise what they wrote. ${onward}`;
+  }
 
   if (rounds === 0) {
-    if (firstTurnWords < SHORT_FIRST_TURN) {
-      return `${facts} That opening reply is short, but it is not empty — build on whatever they did name. Ask exactly three questions. The first must be a scene question walking them through a concrete moment in time, built around the thing they actually mentioned: if they said they will be a teacher at a primary school, ask what a morning in that classroom will look like, not what a normal day looks like in general. The other two must also refer to something in their own words. Never send a question that could have been put to any other participant unchanged.${reminder}`;
-    }
-    if (firstTurnWords > WORD_TARGET) {
-      return `${facts} They have already given breadth here, so do not ask them to cover more ground. Ask exactly two questions, both drilling further into one single concrete detail they named — choose the most specific image in what they wrote and have them zoom into it. Both must quote or closely echo their own words.`;
-    }
-    return `${facts} Ask exactly three questions. At least two must name something concrete the participant actually wrote — a place, person, object or action from their own reply — inside the question itself. Draw the remaining one from the bank and fit its wording to their material. Never send a question that could have been put to any other participant unchanged.${reminder}`;
+    return `${facts} The next one is the SCENE question, and for this phase it must be built from this exact form and no other: "${SCENE_FORMS[phaseIndex]}"${style}`;
   }
 
-  if (rounds >= MAX_PROBE_ROUNDS && totalWords < NOTHING_TO_REFLECT) {
-    return `${facts} This phase has had its two rounds and they have given you essentially nothing to work with. Do not summarise, do not remark on how little they wrote, and do not mention that they were unsure or could not picture it. Write one short, easy, unbothered sentence moving things along. ${onward} That next opening prompt must still be delivered in full and word for word, including its bold header, its bulleted questions, and its suggested opening lines.`;
+  if (rounds === 1) {
+    return `${facts} The next one is the FELT EXPERIENCE question, and for this phase it must be built from this exact form and no other: "${FELT_FORMS[phaseIndex]}" It must hang off the specific scene they have just described.${style}`;
   }
 
-  if (rounds >= MAX_PROBE_ROUNDS) {
-    return `${facts} This phase has had its two rounds. Ask no further questions here and do not summarise what they wrote. ${onward}`;
-  }
-
-  if (declined && (rounds >= 1 || totalWords >= NOTHING_TO_REFLECT)) {
-    return `${facts} They have just said they have nothing more to add here. Respect that — ask no further questions in this phase, even though the word target has not been met. Do not summarise what they wrote. Move straight on to the next phase.`;
-  }
-
-  if (totalWords < WORD_TARGET) {
-    return `${facts} That is below the ${WORD_TARGET}-word target for this phase, so do not move on yet. Ask another round of two or three questions. Every one of them must drill into something they have already named rather than opening new ground, and none may repeat a question already asked.`;
-  }
-
-  return `${facts} They have passed the ${WORD_TARGET}-word target for this phase. Do not summarise what they wrote. ${onward}`;
+  return `${facts} Both follow-ups are done, so ask nothing further in this phase and do not summarise what they wrote. ${onward}`;
 }
 
 async function isOnTask(phaseHeader, text) {
